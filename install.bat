@@ -33,14 +33,13 @@ echo Укажите API-ключ VirusTotal в config.ini ([virustotal] api_key 
 echo.
 set /p STARTUP="Включить автозапуск при входе в Windows? (y/n): "
 if /i "%STARTUP%"=="y" (
-    python scanner.py --startup on
+    "%~dp0.venv\Scripts\python.exe" "%~dp0scanner.py" --startup on
 ) else (
-    python scanner.py --startup off
+    "%~dp0.venv\Scripts\python.exe" "%~dp0scanner.py" --startup off
 )
 
 echo.
 echo Запуск мониторинга...
-start "" /min "%~dp0.venv\Scripts\pythonw.exe" "%~dp0scanner.py"
-echo Готово. Настройки: config.ini
+call "%~dp0start.bat"
 
 endlocal

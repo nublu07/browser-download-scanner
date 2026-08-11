@@ -32,6 +32,7 @@ CONFIG_PATH = SCRIPT_DIR / "config.ini"
 CACHE_PATH = SCRIPT_DIR / "checked_hashes.json"
 LOG_PATH = SCRIPT_DIR / "scanner.log"
 TASK_NAME = "BrowserDownloadVirusScanner"
+STARTUP_BAT = "BrowserDownloadScanner.bat"
 
 PARTIAL_SUFFIXES = (
     ".crdownload",
@@ -638,45 +639,71 @@ def _run_cmd(args: list[str]) -> subprocess.CompletedProcess[str]:
     )
 
 
+def startup_bat_path() -> Path:
+    appdata = os.environ.get("APPDATA", "")
+    return Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / STARTUP_BAT
+
+
+def startup_bat_content() -> str:
+    return (
+        "@echo off\r\n"
+        f'cd /d "{SCRIPT_DIR}"\r\n'
+        f'start "" /min "{python_executable()}" "{script_path()}"\r\n'
+    )
+
+
+def is_startup_enabled() -> bool:
+    if startup_bat_path().exists():
+        return True
+    result = _run_cmd(["schtasks", "/Query", "/TN", TASK_NAME])
+    return result.returncode == 0
+
+
+def ensure_startup(enabled: bool) -> None:
+    bat = startup_bat_path()
+    if enabled:
+        bat.parent.mkdir(parents=True, exist_ok=True)
+        bat.write_text(startup_bat_content(), encoding="utf-8")
+        logging.info("Автозапуск: ярлык в папке «Автозагрузка» → %s", bat)
+    elif bat.exists():
+        bat.unlink()
+        logging.info("Автозапуск отключён (удалён %s)", bat)
+
+
 def manage_startup(enable: bool | None) -> int:
-    """enable=True — создать задачу, False — удалить, None — показать статус."""
+    """enable=True — автозапуск, False — удалить, None — показать статус."""
     if enable is None:
-        result = _run_cmd(["schtasks", "/Query", "/TN", TASK_NAME, "/FO", "LIST"])
-        if result.returncode == 0:
-            print(f"Автозапуск: ВКЛ (задача «{TASK_NAME}»)")
-            print(result.stdout.strip())
+        if is_startup_enabled():
+            print("Автозапуск: ВКЛ")
+            bat = startup_bat_path()
+            if bat.exists():
+                print(f"  Папка «Автозагрузка»: {bat}")
+            task = _run_cmd(["schtasks", "/Query", "/TN", TASK_NAME, "/FO", "LIST"])
+            if task.returncode == 0:
+                print(f"  Планировщик: {TASK_NAME}")
         else:
-            print(f"Автозапуск: ВЫКЛ (задача «{TASK_NAME}» не найдена)")
+            print("Автозапуск: ВЫКЛ")
         return 0
 
     if enable:
+        ensure_startup(True)
         tr = f'"{python_executable()}" "{script_path()}"'
         cmd = [
-            "schtasks",
-            "/Create",
-            "/TN",
-            TASK_NAME,
-            "/TR",
-            tr,
-            "/SC",
-            "ONLOGON",
-            "/RL",
-            "LIMITED",
-            "/F",
+            "schtasks", "/Create", "/TN", TASK_NAME, "/TR", tr,
+            "/SC", "ONLOGON", "/RL", "LIMITED", "/F",
+            "/WD", str(SCRIPT_DIR),
         ]
         result = _run_cmd(cmd)
-        if result.returncode != 0:
-            print(result.stderr or result.stdout, file=sys.stderr)
-            return result.returncode
-        print(f"Автозапуск включён: {TASK_NAME}")
+        if result.returncode == 0:
+            print(f"Автозапуск: планировщик «{TASK_NAME}» + папка «Автозагрузка»")
+        else:
+            print("Автозапуск: папка «Автозагрузка» (планировщик недоступен без прав админа)")
         _set_config_startup_flag(True)
         return 0
 
-    result = _run_cmd(["schtasks", "/Delete", "/TN", TASK_NAME, "/F"])
-    if result.returncode != 0 and "ERROR: The system cannot find" not in (result.stderr or ""):
-        print(result.stderr or result.stdout, file=sys.stderr)
-        return result.returncode
-    print(f"Автозапуск отключён: {TASK_NAME}")
+    ensure_startup(False)
+    _run_cmd(["schtasks", "/Delete", "/TN", TASK_NAME, "/F"])
+    print("Автозапуск отключён")
     _set_config_startup_flag(False)
     return 0
 
@@ -696,10 +723,8 @@ def run_monitor() -> int:
     settings = load_settings()
     setup_logging(settings.debug)
 
-    if settings.run_at_startup:
-        task_status = _run_cmd(["schtasks", "/Query", "/TN", TASK_NAME])
-        if task_status.returncode != 0:
-            manage_startup(True)
+    if settings.run_at_startup and not is_startup_enabled():
+        ensure_startup(True)
 
     if not settings.api_key:
         logging.error(
