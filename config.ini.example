@@ -1,5 +1,5 @@
 # Файл настроек Browser Download Scanner
-# Скопируйте в config.ini и укажите API-ключ VirusTotal
+# Изменения применяются автоматически (перечитываются каждые 5 сек)
 
 [general]
 enabled = true
@@ -9,6 +9,7 @@ max_file_size_mb = 1024
 scan_existing_on_startup = true
 
 [virustotal]
+# API-ключ: https://www.virustotal.com/gui/my-apikey
 api_key =
 detection_threshold = 1
 

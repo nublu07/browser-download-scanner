@@ -3,8 +3,9 @@
 venv/
 
 # Python cache
-__pycache__/
+.scanner.lock
 *.pyc
+__pycache__/
 
 # Runtime data (local cache and logs)
 checked_hashes.json

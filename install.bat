@@ -1,45 +1,49 @@
 @echo off
 chcp 65001 >nul
-setlocal
+title Browser Download Scanner — установка
+cd /d "%~dp0"
 
-set "DIR=%~dp0"
-cd /d "%DIR%"
+where py >nul 2>&1 && (set "PY=py -3") || (set "PY=python")
 
-where py >nul 2>&1
-if %ERRORLEVEL%==0 (
-    set "PY=py -3"
-) else (
-    set "PY=python"
-)
-
-echo === Browser Download Scanner — установка ===
+echo.
+echo  ============================================
+echo    Browser Download Scanner — установка
+echo  ============================================
+echo.
 
 if not exist "config.ini" (
     copy /Y "config.ini.example" "config.ini" >nul
-    echo Создан config.ini из шаблона.
+    echo [OK] Создан config.ini
 )
 
-if not exist ".venv" (
-    echo Создание виртуального окружения...
+if not exist ".venv\Scripts\python.exe" (
+    echo [*] Создание окружения Python...
     %PY% -m venv .venv
+    if errorlevel 1 (
+        echo [ОШИБКА] Не удалось создать venv. Установите Python 3.10+
+        pause
+        exit /b 1
+    )
 )
 
-call ".venv\Scripts\activate.bat"
-python -m pip install -q --upgrade pip
-pip install -q -r requirements.txt
+echo [*] Установка зависимостей...
+".venv\Scripts\python.exe" -m pip install -q --upgrade pip
+".venv\Scripts\python.exe" -m pip install -q -r requirements.txt
 
 echo.
-echo Укажите API-ключ VirusTotal в config.ini ([virustotal] api_key = ...)
+echo  Укажите API-ключ VirusTotal в config.ini
+echo  https://www.virustotal.com/gui/my-apikey
 echo.
 set /p STARTUP="Включить автозапуск при входе в Windows? (y/n): "
 if /i "%STARTUP%"=="y" (
-    "%~dp0.venv\Scripts\python.exe" "%~dp0scanner.py" --startup on
+    ".venv\Scripts\python.exe" "%~dp0scanner.py" --startup on
 ) else (
-    "%~dp0.venv\Scripts\python.exe" "%~dp0scanner.py" --startup off
+    ".venv\Scripts\python.exe" "%~dp0scanner.py" --startup off
 )
 
 echo.
-echo Запуск мониторинга...
 call "%~dp0start.bat"
-
-endlocal
+echo.
+echo  Готово! Используйте start.bat / stop.bat / status.bat
+echo.
+pause

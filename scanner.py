@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import ctypes
 import hashlib
 import json
 import logging
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -21,7 +23,7 @@ import webbrowser
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import requests
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
@@ -31,6 +33,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = SCRIPT_DIR / "config.ini"
 CACHE_PATH = SCRIPT_DIR / "checked_hashes.json"
 LOG_PATH = SCRIPT_DIR / "scanner.log"
+LOCK_PATH = SCRIPT_DIR / ".scanner.lock"
 TASK_NAME = "BrowserDownloadVirusScanner"
 STARTUP_BAT = "BrowserDownloadScanner.bat"
 
@@ -68,11 +71,19 @@ def expand_path(raw: str) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(raw.strip()))).resolve()
 
 
-def load_settings() -> Settings:
-    parser = configparser.ConfigParser(interpolation=None)
-    if not CONFIG_PATH.exists():
+def ensure_config() -> None:
+    if CONFIG_PATH.exists():
+        return
+    example = SCRIPT_DIR / "config.ini.example"
+    if example.exists():
+        shutil.copy2(example, CONFIG_PATH)
+    else:
         raise FileNotFoundError(f"Не найден файл настроек: {CONFIG_PATH}")
 
+
+def load_settings() -> Settings:
+    ensure_config()
+    parser = configparser.ConfigParser(interpolation=None)
     parser.read(CONFIG_PATH, encoding="utf-8")
     g = parser["general"] if parser.has_section("general") else {}
     vt = parser["virustotal"] if parser.has_section("virustotal") else {}
@@ -255,7 +266,47 @@ def defender_quarantine(path: Path) -> bool:
         return False
 
 
+def _process_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+    if handle:
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    return False
+
+
+def acquire_lock() -> bool:
+    if LOCK_PATH.exists():
+        try:
+            pid = int(LOCK_PATH.read_text(encoding="utf-8").strip())
+            if _process_alive(pid):
+                return False
+        except (ValueError, OSError):
+            pass
+    LOCK_PATH.write_text(str(os.getpid()), encoding="utf-8")
+    return True
+
+
+def release_lock() -> None:
+    try:
+        LOCK_PATH.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _xml_escape(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
 def show_notification(title: str, message: str) -> None:
+    title = _xml_escape(title)
+    message = _xml_escape(message)
     try:
         ps = (
             f"[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, "
@@ -336,7 +387,7 @@ class ScanWorker(threading.Thread):
     def __init__(
         self,
         work_queue: queue.Queue[Path],
-        settings_provider: callable,
+        settings_provider: Callable[[], Settings],
         cache: HashCache,
     ) -> None:
         super().__init__(daemon=True, name="ScanWorker")
@@ -528,7 +579,7 @@ class DownloadHandler(FileSystemEventHandler):
     def __init__(
         self,
         work_queue: queue.Queue[Path],
-        settings_provider: callable,
+        settings_provider: Callable[[], Settings],
         debounce: float,
     ) -> None:
         super().__init__()
@@ -590,7 +641,7 @@ class DownloadHandler(FileSystemEventHandler):
 
 
 class ConfigReloader(threading.Thread):
-    def __init__(self, callback: callable, interval: float = 5.0) -> None:
+    def __init__(self, callback: Callable[[], None], interval: float = 5.0) -> None:
         super().__init__(daemon=True, name="ConfigReloader")
         self.callback = callback
         self.interval = interval
@@ -648,8 +699,38 @@ def startup_bat_content() -> str:
     return (
         "@echo off\r\n"
         f'cd /d "{SCRIPT_DIR}"\r\n'
-        f'start "" /min "{python_executable()}" "{script_path()}"\r\n'
+        f'call "{SCRIPT_DIR / "start.bat"}"\r\n'
     )
+
+
+def print_status() -> int:
+    setup_logging(False)
+    print(f"Папка:     {SCRIPT_DIR}")
+    print(f"Настройки: {CONFIG_PATH}")
+    try:
+        settings = load_settings()
+        print(f"Мониторинг: {'ВКЛ' if settings.enabled else 'ВЫКЛ'}")
+        print(f"Папка загрузок: {settings.watch_folder}")
+        print(f"API-ключ: {'задан' if settings.api_key else 'НЕ ЗАДАН'}")
+    except Exception as exc:
+        print(f"Ошибка настроек: {exc}")
+        return 1
+    if LOCK_PATH.exists():
+        try:
+            pid = int(LOCK_PATH.read_text(encoding="utf-8").strip())
+            if _process_alive(pid):
+                print(f"Сканер:    ЗАПУЩЕН (PID {pid})")
+            else:
+                print("Сканер:    НЕ ЗАПУЩЕН (устаревший lock-файл)")
+        except (ValueError, OSError):
+            print("Сканер:    неизвестно")
+    else:
+        print("Сканер:    НЕ ЗАПУЩЕН")
+    if is_startup_enabled():
+        print("Автозапуск: ВКЛ")
+    else:
+        print("Автозапуск: ВЫКЛ")
+    return 0
 
 
 def is_startup_enabled() -> bool:
@@ -719,6 +800,11 @@ def _set_config_startup_flag(enabled: bool) -> None:
 
 
 def run_monitor() -> int:
+    if not acquire_lock():
+        pid = LOCK_PATH.read_text(encoding="utf-8").strip()
+        print(f"Сканер уже запущен (PID {pid}). Используйте stop.bat для остановки.", file=sys.stderr)
+        return 1
+
     settings_lock = threading.Lock()
     settings = load_settings()
     setup_logging(settings.debug)
@@ -779,6 +865,7 @@ def run_monitor() -> int:
     finally:
         observer.stop()
         observer.join()
+        release_lock()
 
     return 0
 
@@ -797,7 +884,15 @@ def main() -> int:
         metavar="PATH",
         help="Проверить один файл и выйти (для теста, без требования метки браузера)",
     )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Показать статус сканера и настроек",
+    )
     args = parser.parse_args()
+
+    if args.status:
+        return print_status()
 
     if args.scan_file:
         target = expand_path(args.scan_file)
