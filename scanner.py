@@ -133,8 +133,13 @@ class HashCache:
         with self._lock:
             return sha256 in self._data
 
+    def get(self, sha256: str) -> dict[str, Any] | None:
+        with self._lock:
+            entry = self._data.get(sha256)
+            return dict(entry) if entry else None
+
     def has_file(self, file_path: Path) -> bool:
-        """Быстрая проверка: тот же путь и размер уже в кэше."""
+        """Быстрая проверка: тот же путь, размер и время изменения уже в кэше."""
         try:
             stat = file_path.stat()
         except OSError:
@@ -142,11 +147,22 @@ class HashCache:
         target = str(file_path.resolve())
         with self._lock:
             for entry in self._data.values():
-                if entry.get("path") == target and entry.get("size") == stat.st_size:
+                if (
+                    entry.get("path") == target
+                    and entry.get("size") == stat.st_size
+                    and entry.get("mtime") == stat.st_mtime
+                ):
                     return True
         return False
 
-    def add(self, sha256: str, file_path: Path, verdict: str) -> None:
+    def add(
+        self,
+        sha256: str,
+        file_path: Path,
+        verdict: str,
+        *,
+        malicious_count: int | None = None,
+    ) -> None:
         try:
             stat = file_path.stat()
             size = stat.st_size
@@ -155,11 +171,13 @@ class HashCache:
             size = None
             mtime = None
         with self._lock:
+            prev = self._data.get(sha256, {})
             self._data[sha256] = {
                 "path": str(file_path.resolve()),
                 "size": size,
                 "mtime": mtime,
                 "verdict": verdict,
+                "malicious_count": malicious_count or prev.get("malicious_count"),
                 "checked_at": datetime.now(timezone.utc).isoformat(),
             }
             self._save_unlocked()
@@ -329,7 +347,9 @@ class ScanWorker(threading.Thread):
         while True:
             path = self.work_queue.get()
             try:
-                process_download(path, self.settings_provider(), self.cache)
+                process_download(
+                    path, self.settings_provider(), self.cache, source="watcher"
+                )
             except Exception:
                 logging.exception("Ошибка проверки %s", path)
             finally:
@@ -357,12 +377,28 @@ def wait_for_analysis(
     return None
 
 
+def alert_malicious(path: Path, sha256: str, malicious: int, link: str) -> None:
+    logging.warning(
+        "УГРОЗА: %s — %s движков, %s",
+        path.name,
+        malicious,
+        link,
+    )
+    webbrowser.open(link)
+    defender_quarantine(path)
+    show_notification(
+        "Обнаружена угроза",
+        f"{path.name}: {malicious} движков VirusTotal. Файл отправлен в карантин.",
+    )
+
+
 def process_download(
     path: Path,
     settings: Settings,
     cache: HashCache,
     *,
     require_browser_mark: bool = True,
+    source: str = "watcher",
 ) -> str:
     """Проверяет один файл. Возвращает статус: skipped, clean, malicious, error."""
     if not settings.enabled:
@@ -395,6 +431,14 @@ def process_download(
     sha256 = sha256_file(path)
 
     if cache.contains(sha256):
+        entry = cache.get(sha256) or {}
+        if source == "watcher" and entry.get("verdict") == "malicious":
+            link = VirusTotalClient.analysis_link(sha256)
+            malicious = int(entry.get("malicious_count", 1))
+            logging.warning("Повторная загрузка известной угрозы: %s", path.name)
+            alert_malicious(path, sha256, malicious, link)
+            cache.add(sha256, path, "malicious", malicious_count=malicious)
+            return "malicious"
         logging.info("Уже проверен ранее: %s", path.name)
         return "skipped"
 
@@ -434,20 +478,8 @@ def process_download(
     link = vt.analysis_link(report_sha)
 
     if malicious >= settings.detection_threshold:
-        logging.warning(
-            "УГРОЗА: %s — %s движков (порог %s), %s",
-            path.name,
-            malicious,
-            settings.detection_threshold,
-            link,
-        )
-        webbrowser.open(link)
-        defender_quarantine(path)
-        show_notification(
-            "Обнаружена угроза",
-            f"{path.name}: {malicious} движков VirusTotal. Файл отправлен в карантин.",
-        )
-        cache.add(report_sha, path, "malicious")
+        alert_malicious(path, report_sha, malicious, link)
+        cache.add(report_sha, path, "malicious", malicious_count=malicious)
         return "malicious"
 
     logging.info("Чисто: %s (%s)", path.name, link)
@@ -482,7 +514,9 @@ def scan_file_cli(path: Path) -> int:
     setup_logging(True)
     cache = HashCache(CACHE_PATH)
     logging.info("Ручная проверка: %s", path)
-    result = process_download(path.resolve(), settings, cache, require_browser_mark=False)
+    result = process_download(
+        path.resolve(), settings, cache, require_browser_mark=False, source="manual"
+    )
     logging.info("Результат: %s", result)
     return 0 if result in {"clean", "malicious", "skipped"} else 1
 
@@ -504,6 +538,9 @@ class DownloadHandler(FileSystemEventHandler):
         self._lock = threading.Lock()
 
     def on_created(self, event: FileSystemEvent) -> None:
+        self._schedule(event)
+
+    def on_modified(self, event: FileSystemEvent) -> None:
         self._schedule(event)
 
     def on_moved(self, event: FileSystemEvent) -> None:
@@ -578,6 +615,12 @@ class ConfigReloader(threading.Thread):
 
 
 def python_executable() -> str:
+    venv_pythonw = SCRIPT_DIR / ".venv" / "Scripts" / "pythonw.exe"
+    if venv_pythonw.exists():
+        return str(venv_pythonw)
+    venv_python = SCRIPT_DIR / ".venv" / "Scripts" / "python.exe"
+    if venv_python.exists():
+        return str(venv_python)
     return sys.executable
 
 

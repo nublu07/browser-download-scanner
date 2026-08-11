@@ -40,7 +40,7 @@ if /i "%STARTUP%"=="y" (
 
 echo.
 echo Запуск мониторинга...
-start "" /min pythonw scanner.py
+start "" /min "%~dp0.venv\Scripts\pythonw.exe" "%~dp0scanner.py"
 echo Готово. Настройки: config.ini
 
 endlocal
