@@ -1,0 +1,619 @@
+#!/usr/bin/env python3
+"""
+Мониторинг загрузок из браузера в папке «Загрузки» с проверкой через VirusTotal.
+Обрабатывает только файлы с меткой Mark of the Web (Zone.Identifier).
+"""
+
+from __future__ import annotations
+
+import argparse
+import configparser
+import hashlib
+import json
+import logging
+import os
+import queue
+import subprocess
+import sys
+import threading
+import time
+import webbrowser
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import requests
+from watchdog.events import FileSystemEvent, FileSystemEventHandler
+from watchdog.observers import Observer
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = SCRIPT_DIR / "config.ini"
+CACHE_PATH = SCRIPT_DIR / "checked_hashes.json"
+LOG_PATH = SCRIPT_DIR / "scanner.log"
+TASK_NAME = "BrowserDownloadVirusScanner"
+
+PARTIAL_SUFFIXES = (
+    ".crdownload",
+    ".part",
+    ".tmp",
+    ".download",
+    ".partial",
+    ".!ut",
+    ".opdownload",
+)
+
+VT_API = "https://www.virustotal.com/api/v3"
+
+
+@dataclass
+class Settings:
+    enabled: bool = True
+    run_at_startup: bool = True
+    watch_folder: Path = Path.home() / "Downloads"
+    max_file_size_mb: int = 1024
+    api_key: str = ""
+    detection_threshold: int = 1
+    debounce_seconds: float = 1.5
+    api_rate_limit_seconds: float = 15.0
+    scan_workers: int = 1
+    debug: bool = False
+
+
+def expand_path(raw: str) -> Path:
+    return Path(os.path.expandvars(os.path.expanduser(raw.strip()))).resolve()
+
+
+def load_settings() -> Settings:
+    parser = configparser.ConfigParser()
+    if not CONFIG_PATH.exists():
+        raise FileNotFoundError(f"Не найден файл настроек: {CONFIG_PATH}")
+
+    parser.read(CONFIG_PATH, encoding="utf-8")
+    g = parser["general"] if parser.has_section("general") else {}
+    vt = parser["virustotal"] if parser.has_section("virustotal") else {}
+    perf = parser["performance"] if parser.has_section("performance") else {}
+    log = parser["logging"] if parser.has_section("logging") else {}
+
+    return Settings(
+        enabled=g.getboolean("enabled", fallback=True),
+        run_at_startup=g.getboolean("run_at_startup", fallback=True),
+        watch_folder=expand_path(g.get("watch_folder", str(Path.home() / "Downloads"))),
+        max_file_size_mb=g.getint("max_file_size_mb", fallback=1024),
+        api_key=vt.get("api_key", fallback="").strip(),
+        detection_threshold=vt.getint("detection_threshold", fallback=1),
+        debounce_seconds=perf.getfloat("debounce_seconds", fallback=1.5),
+        api_rate_limit_seconds=perf.getfloat("api_rate_limit_seconds", fallback=15.0),
+        scan_workers=max(1, perf.getint("scan_workers", fallback=1)),
+        debug=log.getboolean("debug", fallback=False),
+    )
+
+
+def setup_logging(debug: bool) -> None:
+    level = logging.DEBUG if debug else logging.INFO
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    if debug:
+        handlers.append(logging.FileHandler(LOG_PATH, encoding="utf-8"))
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=handlers,
+        force=True,
+    )
+
+
+class HashCache:
+    """Кэш уже проверенных файлов (по SHA-256)."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+        self._data: dict[str, dict[str, Any]] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            return
+        try:
+            with self.path.open("r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+            if isinstance(raw, dict):
+                self._data = raw
+        except (json.JSONDecodeError, OSError) as exc:
+            logging.warning("Не удалось прочитать кэш: %s", exc)
+
+    def contains(self, sha256: str) -> bool:
+        with self._lock:
+            return sha256 in self._data
+
+    def add(self, sha256: str, file_path: Path, verdict: str) -> None:
+        with self._lock:
+            self._data[sha256] = {
+                "path": str(file_path),
+                "verdict": verdict,
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._save_unlocked()
+
+    def _save_unlocked(self) -> None:
+        tmp = self.path.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(self._data, fh, ensure_ascii=False, indent=2)
+        tmp.replace(self.path)
+
+
+def is_partial_download(path: Path) -> bool:
+    name = path.name.lower()
+    return any(name.endswith(suffix) for suffix in PARTIAL_SUFFIXES)
+
+
+def is_browser_download(path: Path) -> bool:
+    """Файл помечен Windows как загруженный из интернета (Mark of the Web)."""
+    zone_path = f"{path}:Zone.Identifier"
+    try:
+        with open(zone_path, "rb") as fh:
+            content = fh.read().decode("utf-8", errors="ignore").lower()
+    except OSError:
+        return False
+    return "zoneid=3" in content or "zoneid=4" in content
+
+
+def is_file_stable(path: Path, pause: float = 0.4) -> bool:
+    """Файл не меняется и не заблокирован загрузчиком."""
+    try:
+        size1 = path.stat().st_size
+        time.sleep(pause)
+        size2 = path.stat().st_size
+        if size1 != size2:
+            return False
+        with path.open("rb"):
+            pass
+        return True
+    except OSError:
+        return False
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def defender_quarantine(path: Path) -> bool:
+    """Запускает точечную проверку Windows Defender; угрозы помещаются в карантин."""
+    candidates = [
+        Path(r"C:\Program Files\Windows Defender\MpCmdRun.exe"),
+        Path(r"C:\Program Files (x86)\Windows Defender\MpCmdRun.exe"),
+    ]
+    mpcmd = next((p for p in candidates if p.exists()), None)
+    if not mpcmd:
+        logging.error("MpCmdRun.exe не найден — карантин Defender недоступен")
+        return False
+
+    try:
+        result = subprocess.run(
+            [str(mpcmd), "-Scan", "-ScanType", "3", "-File", str(path)],
+            capture_output=True,
+            text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            timeout=120,
+        )
+        logging.info("Defender scan exit=%s для %s", result.returncode, path.name)
+        return result.returncode == 0
+    except (subprocess.SubprocessError, OSError) as exc:
+        logging.error("Ошибка Defender: %s", exc)
+        return False
+
+
+def show_notification(title: str, message: str) -> None:
+    try:
+        ps = (
+            f"[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, "
+            f"ContentType = WindowsRuntime] | Out-Null; "
+            f"$t = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('VirusTotal Scanner'); "
+            f"$x = [Windows.Data.Xml.Dom.XmlDocument]::new(); "
+            f"$x.LoadXml('<toast><visual><binding template=\"ToastText02\">"
+            f"<text id=\"1\">{title}</text><text id=\"2\">{message}</text>"
+            f"</binding></visual></toast>'); "
+            f"$t.Show([Windows.UI.Notifications.ToastNotification]::new($x))"
+        )
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError):
+        logging.info("%s — %s", title, message)
+
+
+class VirusTotalClient:
+    def __init__(self, api_key: str, rate_limit: float) -> None:
+        self.api_key = api_key
+        self.rate_limit = rate_limit
+        self._lock = threading.Lock()
+        self._last_request = 0.0
+        self.session = requests.Session()
+        self.session.headers.update({"x-apikey": api_key})
+
+    def _throttle(self) -> None:
+        with self._lock:
+            elapsed = time.monotonic() - self._last_request
+            if elapsed < self.rate_limit:
+                time.sleep(self.rate_limit - elapsed)
+            self._last_request = time.monotonic()
+
+    def lookup_hash(self, sha256: str) -> dict[str, Any] | None:
+        self._throttle()
+        url = f"{VT_API}/files/{sha256}"
+        resp = self.session.get(url, timeout=30)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()
+
+    def upload_file(self, path: Path) -> dict[str, Any]:
+        self._throttle()
+        url = f"{VT_API}/files"
+        with path.open("rb") as fh:
+            resp = self.session.post(url, files={"file": (path.name, fh)}, timeout=300)
+        resp.raise_for_status()
+        return resp.json()
+
+    @staticmethod
+    def malicious_count(report: dict[str, Any]) -> int:
+        attrs = report.get("data", {}).get("attributes", {})
+        stats = attrs.get("last_analysis_stats", {})
+        return int(stats.get("malicious", 0))
+
+    @staticmethod
+    def analysis_link(sha256: str) -> str:
+        return f"https://www.virustotal.com/gui/file/{sha256}"
+
+
+class ScanWorker(threading.Thread):
+    def __init__(
+        self,
+        work_queue: queue.Queue[Path],
+        settings_provider: callable,
+        cache: HashCache,
+    ) -> None:
+        super().__init__(daemon=True, name="ScanWorker")
+        self.work_queue = work_queue
+        self.settings_provider = settings_provider
+        self.cache = cache
+
+    def run(self) -> None:
+        while True:
+            path = self.work_queue.get()
+            try:
+                self._process(path)
+            except Exception:
+                logging.exception("Ошибка проверки %s", path)
+            finally:
+                self.work_queue.task_done()
+
+    def _process(self, path: Path) -> None:
+        settings = self.settings_provider()
+        if not settings.enabled:
+            return
+        if not path.exists() or not path.is_file():
+            return
+        if not settings.api_key:
+            logging.warning("API-ключ VirusTotal не задан в config.ini — пропуск %s", path.name)
+            return
+
+        max_bytes = settings.max_file_size_mb * 1024 * 1024
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return
+        if size > max_bytes:
+            logging.info("Пропуск (>%s МБ): %s", settings.max_file_size_mb, path.name)
+            return
+
+        if not is_browser_download(path):
+            logging.debug("Не браузерная загрузка: %s", path.name)
+            return
+
+        logging.info("Проверка: %s", path.name)
+        sha256 = sha256_file(path)
+
+        if self.cache.contains(sha256):
+            logging.info("Уже проверен ранее: %s", path.name)
+            return
+
+        vt = VirusTotalClient(settings.api_key, settings.api_rate_limit_seconds)
+        report = vt.lookup_hash(sha256)
+
+        if report is None:
+            logging.info("Загрузка на VirusTotal: %s", path.name)
+            upload_resp = vt.upload_file(path)
+            upload_id = upload_resp.get("data", {}).get("id")
+            if not upload_id:
+                logging.error("VirusTotal не принял файл: %s", path.name)
+                return
+            report = self._wait_for_analysis(vt, upload_id)
+            if report is None:
+                logging.error("Таймаут анализа VirusTotal: %s", path.name)
+                return
+
+        malicious = vt.malicious_count(report)
+        link = vt.analysis_link(sha256)
+
+        if malicious >= settings.detection_threshold:
+            logging.warning(
+                "УГРОЗА: %s — %s/%s движков, %s",
+                path.name,
+                malicious,
+                settings.detection_threshold,
+                link,
+            )
+            webbrowser.open(link)
+            defender_quarantine(path)
+            show_notification(
+                "Обнаружена угроза",
+                f"{path.name}: {malicious} движков VirusTotal. Файл отправлен в карантин.",
+            )
+            self.cache.add(sha256, path, "malicious")
+        else:
+            logging.info("Чисто: %s (%s)", path.name, link)
+            self.cache.add(sha256, path, "clean")
+
+    def _wait_for_analysis(
+        self, vt: VirusTotalClient, analysis_id: str, timeout: float = 300.0
+    ) -> dict[str, Any] | None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            vt._throttle()
+            resp = vt.session.get(f"{VT_API}/analyses/{analysis_id}", timeout=30)
+            resp.raise_for_status()
+            payload = resp.json()
+            status = payload.get("data", {}).get("attributes", {}).get("status")
+            if status == "completed":
+                sha256 = payload.get("meta", {}).get("file_info", {}).get("sha256")
+                if sha256:
+                    return vt.lookup_hash(sha256)
+                return payload
+            time.sleep(5)
+        return None
+
+
+class DownloadHandler(FileSystemEventHandler):
+    """Быстрая фильтрация событий (<0.5 с до постановки в очередь)."""
+
+    def __init__(
+        self,
+        work_queue: queue.Queue[Path],
+        settings_provider: callable,
+        debounce: float,
+    ) -> None:
+        super().__init__()
+        self.work_queue = work_queue
+        self.settings_provider = settings_provider
+        self.debounce = debounce
+        self._timers: dict[str, threading.Timer] = {}
+        self._lock = threading.Lock()
+
+    def on_created(self, event: FileSystemEvent) -> None:
+        self._schedule(event)
+
+    def on_moved(self, event: FileSystemEvent) -> None:
+        if not event.is_directory:
+            self._schedule(event, dest=getattr(event, "dest_path", None))
+
+    def _schedule(self, event: FileSystemEvent, dest: str | None = None) -> None:
+        if event.is_directory:
+            return
+
+        settings = self.settings_provider()
+        if not settings.enabled:
+            return
+
+        path = Path(dest or event.src_path)
+        if is_partial_download(path):
+            return
+
+        key = str(path).lower()
+        with self._lock:
+            old = self._timers.pop(key, None)
+            if old:
+                old.cancel()
+
+            def enqueue() -> None:
+                with self._lock:
+                    self._timers.pop(key, None)
+                if not path.exists():
+                    return
+                if is_partial_download(path):
+                    return
+                if not is_file_stable(path):
+                    with self._lock:
+                        self._timers[key] = threading.Timer(
+                            self.debounce, enqueue
+                        )
+                        self._timers[key].daemon = True
+                        self._timers[key].start()
+                    return
+                self.work_queue.put(path)
+
+            timer = threading.Timer(settings.debounce_seconds, enqueue)
+            timer.daemon = True
+            timer.start()
+            self._timers[key] = timer
+
+
+class ConfigReloader(threading.Thread):
+    def __init__(self, callback: callable, interval: float = 5.0) -> None:
+        super().__init__(daemon=True, name="ConfigReloader")
+        self.callback = callback
+        self.interval = interval
+        self._mtime: float | None = None
+
+    def run(self) -> None:
+        while True:
+            time.sleep(self.interval)
+            try:
+                mtime = CONFIG_PATH.stat().st_mtime
+            except OSError:
+                continue
+            if self._mtime is None:
+                self._mtime = mtime
+                continue
+            if mtime != self._mtime:
+                self._mtime = mtime
+                try:
+                    self.callback()
+                    logging.info("Настройки перечитаны из config.ini")
+                except Exception:
+                    logging.exception("Ошибка перечитывания config.ini")
+
+
+def python_executable() -> str:
+    return sys.executable
+
+
+def script_path() -> str:
+    return str(Path(__file__).resolve())
+
+
+def _run_cmd(args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def manage_startup(enable: bool | None) -> int:
+    """enable=True — создать задачу, False — удалить, None — показать статус."""
+    if enable is None:
+        result = _run_cmd(["schtasks", "/Query", "/TN", TASK_NAME, "/FO", "LIST"])
+        if result.returncode == 0:
+            print(f"Автозапуск: ВКЛ (задача «{TASK_NAME}»)")
+            print(result.stdout.strip())
+        else:
+            print(f"Автозапуск: ВЫКЛ (задача «{TASK_NAME}» не найдена)")
+        return 0
+
+    if enable:
+        tr = f'"{python_executable()}" "{script_path()}"'
+        cmd = [
+            "schtasks",
+            "/Create",
+            "/TN",
+            TASK_NAME,
+            "/TR",
+            tr,
+            "/SC",
+            "ONLOGON",
+            "/RL",
+            "LIMITED",
+            "/F",
+        ]
+        result = _run_cmd(cmd)
+        if result.returncode != 0:
+            print(result.stderr or result.stdout, file=sys.stderr)
+            return result.returncode
+        print(f"Автозапуск включён: {TASK_NAME}")
+        _set_config_startup_flag(True)
+        return 0
+
+    result = _run_cmd(["schtasks", "/Delete", "/TN", TASK_NAME, "/F"])
+    if result.returncode != 0 and "ERROR: The system cannot find" not in (result.stderr or ""):
+        print(result.stderr or result.stdout, file=sys.stderr)
+        return result.returncode
+    print(f"Автозапуск отключён: {TASK_NAME}")
+    _set_config_startup_flag(False)
+    return 0
+
+
+def _set_config_startup_flag(enabled: bool) -> None:
+    parser = configparser.ConfigParser()
+    parser.read(CONFIG_PATH, encoding="utf-8")
+    if not parser.has_section("general"):
+        parser.add_section("general")
+    parser.set("general", "run_at_startup", "true" if enabled else "false")
+    with CONFIG_PATH.open("w", encoding="utf-8") as fh:
+        parser.write(fh)
+
+
+def run_monitor() -> int:
+    settings_lock = threading.Lock()
+    settings = load_settings()
+    setup_logging(settings.debug)
+
+    if settings.run_at_startup:
+        manage_startup(True)
+
+    watch_folder = settings.watch_folder
+    if not watch_folder.is_dir():
+        logging.error("Папка мониторинга не существует: %s", watch_folder)
+        return 1
+
+    def get_settings() -> Settings:
+        with settings_lock:
+            return settings
+
+    def reload_settings() -> None:
+        nonlocal settings
+        new_settings = load_settings()
+        with settings_lock:
+            settings = new_settings
+        setup_logging(settings.debug)
+
+    cache = HashCache(CACHE_PATH)
+    work_queue: queue.Queue[Path] = queue.Queue()
+
+    workers = settings.scan_workers
+    for _ in range(workers):
+        ScanWorker(work_queue, get_settings, cache).start()
+
+    handler = DownloadHandler(work_queue, get_settings, settings.debounce_seconds)
+    observer = Observer()
+    observer.schedule(handler, str(watch_folder), recursive=False)
+    observer.start()
+
+    ConfigReloader(reload_settings).start()
+
+    logging.info("Мониторинг: %s (только браузерные загрузки)", watch_folder)
+    logging.info("Настройки: %s", CONFIG_PATH)
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logging.info("Остановка...")
+    finally:
+        observer.stop()
+        observer.join()
+
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Проверка браузерных загрузок через VirusTotal"
+    )
+    parser.add_argument(
+        "--startup",
+        choices=["on", "off", "status"],
+        help="Управление автозапуском при входе в Windows",
+    )
+    args = parser.parse_args()
+
+    if args.startup == "on":
+        return manage_startup(True)
+    if args.startup == "off":
+        return manage_startup(False)
+    if args.startup == "status":
+        return manage_startup(None)
+
+    return run_monitor()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

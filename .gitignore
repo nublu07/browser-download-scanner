@@ -1,0 +1,15 @@
+# Virtual environment
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Runtime data (local cache and logs)
+checked_hashes.json
+scanner.log
+*.tmp
+
+# Local config with API key (use config.ini.example as template)
+config.ini
