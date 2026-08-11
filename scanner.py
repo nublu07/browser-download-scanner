@@ -44,6 +44,8 @@ PARTIAL_SUFFIXES = (
 )
 
 VT_API = "https://www.virustotal.com/api/v3"
+VT_MAX_UPLOAD_BYTES = 32 * 1024 * 1024  # лимит бесплатного API VirusTotal
+ENV_API_KEY = "VIRUSTOTAL_API_KEY"
 
 
 @dataclass
@@ -58,6 +60,7 @@ class Settings:
     api_rate_limit_seconds: float = 15.0
     scan_workers: int = 1
     debug: bool = False
+    scan_existing_on_startup: bool = True
 
 
 def expand_path(raw: str) -> Path:
@@ -65,7 +68,7 @@ def expand_path(raw: str) -> Path:
 
 
 def load_settings() -> Settings:
-    parser = configparser.ConfigParser()
+    parser = configparser.ConfigParser(interpolation=None)
     if not CONFIG_PATH.exists():
         raise FileNotFoundError(f"Не найден файл настроек: {CONFIG_PATH}")
 
@@ -75,25 +78,29 @@ def load_settings() -> Settings:
     perf = parser["performance"] if parser.has_section("performance") else {}
     log = parser["logging"] if parser.has_section("logging") else {}
 
+    api_key = vt.get("api_key", fallback="").strip() or os.environ.get(ENV_API_KEY, "").strip()
+
     return Settings(
         enabled=g.getboolean("enabled", fallback=True),
         run_at_startup=g.getboolean("run_at_startup", fallback=True),
         watch_folder=expand_path(g.get("watch_folder", str(Path.home() / "Downloads"))),
         max_file_size_mb=g.getint("max_file_size_mb", fallback=1024),
-        api_key=vt.get("api_key", fallback="").strip(),
+        api_key=api_key,
         detection_threshold=vt.getint("detection_threshold", fallback=1),
         debounce_seconds=perf.getfloat("debounce_seconds", fallback=1.5),
         api_rate_limit_seconds=perf.getfloat("api_rate_limit_seconds", fallback=15.0),
         scan_workers=max(1, perf.getint("scan_workers", fallback=1)),
         debug=log.getboolean("debug", fallback=False),
+        scan_existing_on_startup=g.getboolean("scan_existing_on_startup", fallback=True),
     )
 
 
 def setup_logging(debug: bool) -> None:
     level = logging.DEBUG if debug else logging.INFO
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
-    if debug:
-        handlers.append(logging.FileHandler(LOG_PATH, encoding="utf-8"))
+    file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    file_handler.setLevel(level)
+    handlers.append(file_handler)
     logging.basicConfig(
         level=level,
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -126,10 +133,32 @@ class HashCache:
         with self._lock:
             return sha256 in self._data
 
+    def has_file(self, file_path: Path) -> bool:
+        """Быстрая проверка: тот же путь и размер уже в кэше."""
+        try:
+            stat = file_path.stat()
+        except OSError:
+            return False
+        target = str(file_path.resolve())
+        with self._lock:
+            for entry in self._data.values():
+                if entry.get("path") == target and entry.get("size") == stat.st_size:
+                    return True
+        return False
+
     def add(self, sha256: str, file_path: Path, verdict: str) -> None:
+        try:
+            stat = file_path.stat()
+            size = stat.st_size
+            mtime = stat.st_mtime
+        except OSError:
+            size = None
+            mtime = None
         with self._lock:
             self._data[sha256] = {
-                "path": str(file_path),
+                "path": str(file_path.resolve()),
+                "size": size,
+                "mtime": mtime,
                 "verdict": verdict,
                 "checked_at": datetime.now(timezone.utc).isoformat(),
             }
@@ -264,8 +293,20 @@ class VirusTotalClient:
     @staticmethod
     def malicious_count(report: dict[str, Any]) -> int:
         attrs = report.get("data", {}).get("attributes", {})
-        stats = attrs.get("last_analysis_stats", {})
+        stats = attrs.get("last_analysis_stats") or attrs.get("stats") or {}
         return int(stats.get("malicious", 0))
+
+    @staticmethod
+    def sha256_from_report(report: dict[str, Any]) -> str | None:
+        attrs = report.get("data", {}).get("attributes", {})
+        if sha := attrs.get("sha256"):
+            return sha
+        meta = report.get("meta", {})
+        if isinstance(meta, dict):
+            info = meta.get("file_info", {})
+            if isinstance(info, dict) and info.get("sha256"):
+                return info["sha256"]
+        return None
 
     @staticmethod
     def analysis_link(sha256: str) -> str:
@@ -288,96 +329,162 @@ class ScanWorker(threading.Thread):
         while True:
             path = self.work_queue.get()
             try:
-                self._process(path)
+                process_download(path, self.settings_provider(), self.cache)
             except Exception:
                 logging.exception("Ошибка проверки %s", path)
             finally:
                 self.work_queue.task_done()
 
-    def _process(self, path: Path) -> None:
-        settings = self.settings_provider()
-        if not settings.enabled:
-            return
-        if not path.exists() or not path.is_file():
-            return
-        if not settings.api_key:
-            logging.warning("API-ключ VirusTotal не задан в config.ini — пропуск %s", path.name)
-            return
 
-        max_bytes = settings.max_file_size_mb * 1024 * 1024
-        try:
-            size = path.stat().st_size
-        except OSError:
-            return
-        if size > max_bytes:
-            logging.info("Пропуск (>%s МБ): %s", settings.max_file_size_mb, path.name)
-            return
+def wait_for_analysis(
+    vt: VirusTotalClient, analysis_id: str, timeout: float = 300.0
+) -> dict[str, Any] | None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        vt._throttle()
+        resp = vt.session.get(f"{VT_API}/analyses/{analysis_id}", timeout=30)
+        resp.raise_for_status()
+        payload = resp.json()
+        status = payload.get("data", {}).get("attributes", {}).get("status")
+        if status == "completed":
+            sha256 = VirusTotalClient.sha256_from_report(payload)
+            if sha256:
+                report = vt.lookup_hash(sha256)
+                if report is not None:
+                    return report
+            return payload
+        time.sleep(5)
+    return None
 
-        if not is_browser_download(path):
-            logging.debug("Не браузерная загрузка: %s", path.name)
-            return
 
-        logging.info("Проверка: %s", path.name)
-        sha256 = sha256_file(path)
+def process_download(
+    path: Path,
+    settings: Settings,
+    cache: HashCache,
+    *,
+    require_browser_mark: bool = True,
+) -> str:
+    """Проверяет один файл. Возвращает статус: skipped, clean, malicious, error."""
+    if not settings.enabled:
+        return "skipped"
+    if not path.exists() or not path.is_file():
+        logging.warning("Файл не найден: %s", path)
+        return "skipped"
+    if not settings.api_key:
+        logging.error(
+            "API-ключ VirusTotal не задан. Укажите его в config.ini или переменной %s",
+            ENV_API_KEY,
+        )
+        return "error"
 
-        if self.cache.contains(sha256):
-            logging.info("Уже проверен ранее: %s", path.name)
-            return
+    max_bytes = settings.max_file_size_mb * 1024 * 1024
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        logging.warning("Не удалось прочитать %s: %s", path.name, exc)
+        return "skipped"
+    if size > max_bytes:
+        logging.info("Пропуск (>%s МБ): %s", settings.max_file_size_mb, path.name)
+        return "skipped"
 
-        vt = VirusTotalClient(settings.api_key, settings.api_rate_limit_seconds)
+    if require_browser_mark and not is_browser_download(path):
+        logging.info("Пропуск (не браузерная загрузка): %s", path.name)
+        return "skipped"
+
+    logging.info("Проверка: %s (%.1f МБ)", path.name, size / (1024 * 1024))
+    sha256 = sha256_file(path)
+
+    if cache.contains(sha256):
+        logging.info("Уже проверен ранее: %s", path.name)
+        return "skipped"
+
+    vt = VirusTotalClient(settings.api_key, settings.api_rate_limit_seconds)
+    try:
         report = vt.lookup_hash(sha256)
+    except requests.HTTPError as exc:
+        logging.error("Ошибка VirusTotal (hash lookup): %s", exc)
+        return "error"
 
-        if report is None:
-            logging.info("Загрузка на VirusTotal: %s", path.name)
-            upload_resp = vt.upload_file(path)
-            upload_id = upload_resp.get("data", {}).get("id")
-            if not upload_id:
-                logging.error("VirusTotal не принял файл: %s", path.name)
-                return
-            report = self._wait_for_analysis(vt, upload_id)
-            if report is None:
-                logging.error("Таймаут анализа VirusTotal: %s", path.name)
-                return
-
-        malicious = vt.malicious_count(report)
-        link = vt.analysis_link(sha256)
-
-        if malicious >= settings.detection_threshold:
-            logging.warning(
-                "УГРОЗА: %s — %s/%s движков, %s",
+    if report is None:
+        if size > VT_MAX_UPLOAD_BYTES:
+            logging.error(
+                "Файл %s (%.1f МБ) отсутствует в базе VirusTotal и превышает лимит "
+                "загрузки 32 МБ. Проверка невозможна без платного API.",
                 path.name,
-                malicious,
-                settings.detection_threshold,
-                link,
+                size / (1024 * 1024),
             )
-            webbrowser.open(link)
-            defender_quarantine(path)
-            show_notification(
-                "Обнаружена угроза",
-                f"{path.name}: {malicious} движков VirusTotal. Файл отправлен в карантин.",
-            )
-            self.cache.add(sha256, path, "malicious")
-        else:
-            logging.info("Чисто: %s (%s)", path.name, link)
-            self.cache.add(sha256, path, "clean")
+            return "error"
+        logging.info("Загрузка на VirusTotal: %s", path.name)
+        try:
+            upload_resp = vt.upload_file(path)
+        except requests.HTTPError as exc:
+            logging.error("Ошибка загрузки на VirusTotal: %s", exc)
+            return "error"
+        upload_id = upload_resp.get("data", {}).get("id")
+        if not upload_id:
+            logging.error("VirusTotal не принял файл: %s", path.name)
+            return "error"
+        report = wait_for_analysis(vt, upload_id)
+        if report is None:
+            logging.error("Таймаут анализа VirusTotal: %s", path.name)
+            return "error"
 
-    def _wait_for_analysis(
-        self, vt: VirusTotalClient, analysis_id: str, timeout: float = 300.0
-    ) -> dict[str, Any] | None:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            vt._throttle()
-            resp = vt.session.get(f"{VT_API}/analyses/{analysis_id}", timeout=30)
-            resp.raise_for_status()
-            payload = resp.json()
-            status = payload.get("data", {}).get("attributes", {}).get("status")
-            if status == "completed":
-                sha256 = payload.get("meta", {}).get("file_info", {}).get("sha256")
-                if sha256:
-                    return vt.lookup_hash(sha256)
-                return payload
-            time.sleep(5)
-        return None
+    malicious = vt.malicious_count(report)
+    report_sha = VirusTotalClient.sha256_from_report(report) or sha256
+    link = vt.analysis_link(report_sha)
+
+    if malicious >= settings.detection_threshold:
+        logging.warning(
+            "УГРОЗА: %s — %s движков (порог %s), %s",
+            path.name,
+            malicious,
+            settings.detection_threshold,
+            link,
+        )
+        webbrowser.open(link)
+        defender_quarantine(path)
+        show_notification(
+            "Обнаружена угроза",
+            f"{path.name}: {malicious} движков VirusTotal. Файл отправлен в карантин.",
+        )
+        cache.add(report_sha, path, "malicious")
+        return "malicious"
+
+    logging.info("Чисто: %s (%s)", path.name, link)
+    cache.add(report_sha, path, "clean")
+    return "clean"
+
+
+def queue_existing_downloads(
+    watch_folder: Path,
+    work_queue: queue.Queue[Path],
+    cache: HashCache,
+) -> int:
+    """Ставит в очередь уже лежащие в папке браузерные загрузки."""
+    queued = 0
+    if not watch_folder.is_dir():
+        return queued
+    for entry in watch_folder.iterdir():
+        if not entry.is_file() or is_partial_download(entry):
+            continue
+        if not is_browser_download(entry):
+            continue
+        if cache.has_file(entry):
+            continue
+        work_queue.put(entry)
+        queued += 1
+        logging.info("В очередь (существующий файл): %s", entry.name)
+    return queued
+
+
+def scan_file_cli(path: Path) -> int:
+    settings = load_settings()
+    setup_logging(True)
+    cache = HashCache(CACHE_PATH)
+    logging.info("Ручная проверка: %s", path)
+    result = process_download(path.resolve(), settings, cache, require_browser_mark=False)
+    logging.info("Результат: %s", result)
+    return 0 if result in {"clean", "malicious", "skipped"} else 1
 
 
 class DownloadHandler(FileSystemEventHandler):
@@ -532,7 +639,7 @@ def manage_startup(enable: bool | None) -> int:
 
 
 def _set_config_startup_flag(enabled: bool) -> None:
-    parser = configparser.ConfigParser()
+    parser = configparser.ConfigParser(interpolation=None)
     parser.read(CONFIG_PATH, encoding="utf-8")
     if not parser.has_section("general"):
         parser.add_section("general")
@@ -547,7 +654,16 @@ def run_monitor() -> int:
     setup_logging(settings.debug)
 
     if settings.run_at_startup:
-        manage_startup(True)
+        task_status = _run_cmd(["schtasks", "/Query", "/TN", TASK_NAME])
+        if task_status.returncode != 0:
+            manage_startup(True)
+
+    if not settings.api_key:
+        logging.error(
+            "API-ключ VirusTotal не задан. Укажите его в config.ini ([virustotal] api_key) "
+            "или в переменной окружения %s",
+            ENV_API_KEY,
+        )
 
     watch_folder = settings.watch_folder
     if not watch_folder.is_dir():
@@ -579,6 +695,11 @@ def run_monitor() -> int:
 
     ConfigReloader(reload_settings).start()
 
+    if settings.scan_existing_on_startup:
+        queued = queue_existing_downloads(watch_folder, work_queue, cache)
+        if queued:
+            logging.info("Найдено %s существующих браузерных загрузок для проверки", queued)
+
     logging.info("Мониторинг: %s (только браузерные загрузки)", watch_folder)
     logging.info("Настройки: %s", CONFIG_PATH)
 
@@ -603,7 +724,19 @@ def main() -> int:
         choices=["on", "off", "status"],
         help="Управление автозапуском при входе в Windows",
     )
+    parser.add_argument(
+        "--scan-file",
+        metavar="PATH",
+        help="Проверить один файл и выйти (для теста, без требования метки браузера)",
+    )
     args = parser.parse_args()
+
+    if args.scan_file:
+        target = expand_path(args.scan_file)
+        if not target.is_file():
+            print(f"Файл не найден: {target}", file=sys.stderr)
+            return 1
+        return scan_file_cli(target)
 
     if args.startup == "on":
         return manage_startup(True)

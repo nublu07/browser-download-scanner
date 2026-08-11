@@ -6,6 +6,7 @@ enabled = true
 run_at_startup = true
 watch_folder = %USERPROFILE%\Downloads
 max_file_size_mb = 1024
+scan_existing_on_startup = true
 
 [virustotal]
 api_key =
